@@ -1,6 +1,6 @@
 # Webhook 事件接收与重放 API
 
-基于 FastAPI + SQLite 的 Webhook 事件接收服务:按 `event_id` 幂等接收(支持单条与 1~1000 条批量、同一写事务续接哈希链)、记录首次接收顺序,支持时间范围分页查询与批量重放,并可创建按 UTC 日期分桶的事件计数视图。
+基于 FastAPI + SQLite 的 Webhook 事件接收服务:按 `event_id` 幂等接收(支持单条与 1~1000 条批量、同一写事务续接哈希链)、记录首次接收顺序,支持时间范围分页查询与批量重放,可创建按 UTC 日期分桶的事件计数视图,并可登记事件间的父子因果关系(唯一父节点、防环、祖先链查询)。
 
 ## 启动
 
@@ -8,7 +8,7 @@
 docker compose up --build
 ```
 
-一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表、日计数视图表)在启动时自动创建/升级,无需手工初始化。
+一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表、日计数视图表、事件关系表)在启动时自动创建/升级,无需手工初始化。
 
 不用 compose 也可以:
 
@@ -464,6 +464,47 @@ curl -X DELETE http://localhost:8000/views/signup-ios
 
 未知名称的查询与删除统一返回 **404**;删除不影响事件本身与其他视图。
 
+### 13. 事件因果关系
+
+为已入库事件登记**唯一父事件**,表达事件间的因果/派生关系(每个事件至多一个父节点,整体构成一片森林)。关系保存在**独立的 `event_relations` 表**,不挂在 `events` 上:原事件之后被安全归档(`/retention/compact` 物理删除)时,已登记关系**仍然保留、仍可按 `event_id` 查询**;但**只能对当前仍存在的事件建立或修改关系**。
+
+设置或更换父事件(幂等):
+
+```bash
+curl -X PUT http://localhost:8000/relations/evt-child/parent \
+  -H 'Content-Type: application/json' \
+  -d '{"parent_event_id":"evt-root"}'
+```
+
+```json
+{"event_id": "evt-child", "parent_event_id": "evt-root",
+ "changed": true, "updated_at": "2026-09-27T08:00:00.000000+00:00"}
+```
+
+- **校验顺序**(全部在单个 `BEGIN IMMEDIATE` 写事务内完成):子事件必须当前仍存在,否则 **404** `event not found`;父事件同样必须当前仍存在,否则 **404** `parent event not found`。
+- **防环**:沿候选父事件的父链向上检查(含"父=子"的自环),若本次变更会形成环,返回 **409** `relation would form a cycle`,**原关系保持不变**。
+- **幂等**:重复设置同一个父节点返回 `changed: false`,`updated_at` 保持首次设置的时间不变;更换为不同的父节点返回 `changed: true` 并更新时间。
+- `parent_event_id` 为空或纯空白由请求校验拦截(**422**)。
+
+沿父链查询祖先(从**最近父节点** `depth=1` 到**根节点**):
+
+```bash
+curl http://localhost:8000/relations/evt-leaf/ancestors
+```
+
+```json
+{
+  "event_id": "evt-leaf",
+  "ancestors": [
+    {"event_id": "evt-mid", "depth": 1},
+    {"event_id": "evt-root", "depth": 2}
+  ]
+}
+```
+
+- 从未入库且没有任何已登记关系的 `event_id` 返回 **404** `event not found`;已知但没有父节点的事件返回空列表 `{"ancestors": []}`。
+- 遍历只走关系表:链可以**穿过已归档事件**——例如 `A<-B<-C` 全部归档后,查询 `C` 的祖先仍返回 `B`(depth 1)、`A`(depth 2);但此时再对 `A`/`B`/`C` 调 `PUT .../parent` 会因事件不存在而返回 **404**。
+
 ## 哈希链规范
 
 每条记录写入时在同一事务内计算并存储两个字段:
@@ -495,6 +536,7 @@ curl -X DELETE http://localhost:8000/views/signup-ios
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **持久化快照导出**:`POST /exports` 在单个 `BEGIN IMMEDIATE` 事务内完成"读链锚点 → 写快照元数据(锚点 seq/hash、末尾 seq、总数)→ `INSERT ... SELECT` 整体复制当前全部未压缩事件到 `export_events`",与事件写入、压缩归档串行,副本与元数据来自同一时刻。副本落库后不可变:`GET /exports/{id}/events` 只查快照表,按 `(snapshot_id, seq)` 主键升序分页(多取一条判断 `next_after_seq`,末页为 `null`),后续写入/压缩/重启均不影响;`after_seq` 越出 `[anchor_seq, end_seq]` 返回 422。`DELETE /exports/{id}` 在同一事务内删除元数据与全部副本,未知或已删除统一 404。
 - **事件日计数视图**:规则存 `count_views`(名称 `UNIQUE`,重名 409),日桶计数存 `count_view_buckets`(`(view_id, day)` 主键)。`POST /views` 在单个 `BEGIN IMMEDIATE` 事务内"保存规则 → 全量扫描现存事件按 UTC 日期回填";`/events` 与 `/events/batch` 只对真正新建的条目逐视图匹配增量 +1(重复 `event_id` 走幂等分支,不动视图);`/retention/compact` 在同一事务内对被删前缀逐条扣减并移除空桶——因此视图始终等于"当前 events 表内匹配事件按发生日期的计数",迟到事件按 `occurred_at` 归其发生日期。`GET /views/{name}` 按名称返回各日计数与总数,`DELETE /views/{name}` 单事务删除规则与日桶,未知名称均 404。
+- **事件因果关系**:关系存独立的 `event_relations` 表(`event_id` 主键即"唯一父节点",不挂 `events` 外键)。`PUT /relations/{event_id}/parent` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验子/父事件当前仍存在(否则 404)→ 幂等短路(同父重复设置 `changed=false`,不更新 `updated_at`)→ 沿候选父链防环检查(自环/成环 409 且原关系不变)→ upsert 关系";与事件写入、归档压缩在同一写锁下串行,并发下不会出现半提交的关系变更。`GET /relations/{event_id}/ancestors` 只读关系表,从最近父节点(depth 1)遍历到根;因为关系不随归档删除,原事件被 `/retention/compact` 物理删除后祖先链仍可完整查询(可穿过已归档事件),而已归档事件不能再作为父子建立新关系(404)。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
 ## API 一览
@@ -519,6 +561,8 @@ curl -X DELETE http://localhost:8000/views/signup-ios
 | POST | `/views` | 创建事件日计数视图(唯一名称 + 可选 payload 顶层字符串字段等值条件):单事务回填现存事件,按 UTC 日期分桶;重名 409 |
 | GET | `/views/{name}` | 按名称查询视图:各 UTC 日计数(升序)及总数;未知名称 404 |
 | DELETE | `/views/{name}` | 单事务删除视图规则与全部日桶;未知名称 404 |
+| PUT | `/relations/{event_id}/parent` | 设置/更换唯一父事件(父子须为不同现存事件,否则 404);单事务防环,成环 409 且原关系不变;重复设置同一父幂等(`changed=false`) |
+| GET | `/relations/{event_id}/ancestors` | 祖先链查询:最近父节点(depth 1)到根节点;未知事件 404;关系独立于 events,原事件归档后仍可查询 |
 | GET | `/health` | 健康检查 |
 
 交互式文档:启动后访问 `http://localhost:8000/docs`。

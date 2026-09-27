@@ -90,6 +90,17 @@ class QuarantineIn(BaseModel):
         return v
 
 
+class RelationParentIn(BaseModel):
+    parent_event_id: str = Field(..., min_length=1, max_length=255)
+
+    @field_validator("parent_event_id")
+    @classmethod
+    def parent_not_blank(cls, v: str) -> str:
+        if not v.strip():
+            raise ValueError("parent_event_id must not be blank")
+        return v
+
+
 # ---------- helpers ----------
 
 def normalize_dt(dt: datetime) -> str:
@@ -1228,3 +1239,166 @@ def delete_view(name: str = Path(..., min_length=1, max_length=255)):
         conn.execute("DELETE FROM count_view_buckets WHERE view_id = ?", (view["id"],))
         conn.execute("DELETE FROM count_views WHERE id = ?", (view["id"],))
     return {"name": name, "deleted": True}
+
+
+# ---------- relations: 事件因果关系 ----------
+
+def relation_would_cycle(
+    conn: sqlite3.Connection, event_id: str, parent_event_id: str
+) -> bool:
+    """判断把 event_id 的父事件设为 parent_event_id 是否会成环。
+
+    沿候选父事件的父链向上走(只查独立的关系表, 事件是否仍在 events 表不影响),
+    一旦遇到 event_id 即成环——候选父等于自身(自环)在第一步即可检出。
+    所有写入路径都做了环检查, 现存数据必然无环; seen 仅为防御异常数据时不死循环。
+    调用方须持有写事务。
+    """
+    seen: set[str] = set()
+    cur = parent_event_id
+    while True:
+        if cur == event_id:
+            return True
+        if cur in seen:
+            # 防御: 链上已存在环(理论上不会发生), 终止遍历避免死循环
+            return False
+        seen.add(cur)
+        row = conn.execute(
+            "SELECT parent_event_id FROM event_relations WHERE event_id = ?",
+            (cur,),
+        ).fetchone()
+        if row is None:
+            return False
+        cur = row["parent_event_id"]
+
+
+def walk_ancestors(conn: sqlite3.Connection, event_id: str) -> list[tuple[str, int]]:
+    """沿父链从最近父节点走到根节点, 返回 [(event_id, depth), ...], 深度从 1 开始。
+
+    只查独立的关系表: 原事件已被安全归档(物理删除)后登记关系仍可遍历。
+    seen 为防御性保护, 正常数据无环。
+    """
+    ancestors: list[tuple[str, int]] = []
+    seen = {event_id}
+    cur = event_id
+    depth = 0
+    while True:
+        row = conn.execute(
+            "SELECT parent_event_id FROM event_relations WHERE event_id = ?",
+            (cur,),
+        ).fetchone()
+        if row is None:
+            return ancestors
+        parent = row["parent_event_id"]
+        if parent in seen:
+            # 防御: 链上已存在环, 到此为止
+            return ancestors
+        depth += 1
+        ancestors.append((parent, depth))
+        seen.add(parent)
+        cur = parent
+
+
+def relation_known(conn: sqlite3.Connection, event_id: str) -> bool:
+    """事件是否"已知": 仍是现存事件, 或在关系表中作为子/父出现过(关系不随归档删除)。"""
+    return conn.execute(
+        "SELECT 1 FROM events WHERE event_id = ?"
+        " UNION ALL SELECT 1 FROM event_relations WHERE event_id = ?"
+        " UNION ALL SELECT 1 FROM event_relations WHERE parent_event_id = ?"
+        " LIMIT 1",
+        (event_id, event_id, event_id),
+    ).fetchone() is not None
+
+
+@app.put("/relations/{event_id}/parent")
+def set_parent(
+    event_id: str = Path(..., min_length=1, max_length=255),
+    req: RelationParentIn = Body(...),
+):
+    """为事件设置或更换唯一父事件(每个事件至多一个父节点)。
+
+    - 父子必须是当前仍存在(events 表内)的不同事件: 子或父未知分别返回 404,
+      自环/沿父链会成环返回 409 且原关系不变。
+    - 环检查与写入在同一个写事务(BEGIN IMMEDIATE)内完成, 遍历只看独立关系表,
+      不会被并发写入或已归档事件干扰。
+    - 重复设置同一个父节点幂等: 返回 changed=false 且不更新 updated_at。
+    - 关系独立于 events 保存, 事件之后被安全归档不影响已登记关系;
+      但只能对当前仍存在的事件建立或修改关系。
+    """
+    parent_event_id = req.parent_event_id
+    with get_conn() as conn:
+        # BEGIN IMMEDIATE 与事件写入、归档压缩互斥, 保证"校验 -> 写关系"原子完成
+        conn.execute("BEGIN IMMEDIATE")
+        # 只能对当前仍存在的事件建立/修改关系
+        if conn.execute(
+            "SELECT 1 FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone() is None:
+            return JSONResponse(status_code=404, content={"detail": "event not found"})
+        if conn.execute(
+            "SELECT 1 FROM events WHERE event_id = ?", (parent_event_id,)
+        ).fetchone() is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "parent event not found", "parent_event_id": parent_event_id},
+            )
+
+        existing = conn.execute(
+            "SELECT parent_event_id, updated_at FROM event_relations WHERE event_id = ?",
+            (event_id,),
+        ).fetchone()
+        if existing is not None and existing["parent_event_id"] == parent_event_id:
+            # 重复设置同一父节点: 幂等, 原关系(含 updated_at)保持不变
+            return {
+                "event_id": event_id,
+                "parent_event_id": parent_event_id,
+                "changed": False,
+                "updated_at": existing["updated_at"],
+            }
+
+        # 同一写事务内沿候选父链检查: 自环/成环则拒绝, 不做任何变更
+        if relation_would_cycle(conn, event_id, parent_event_id):
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "detail": "relation would form a cycle",
+                    "event_id": event_id,
+                    "parent_event_id": parent_event_id,
+                },
+            )
+
+        updated_at = utc_now()
+        # 唯一父关系: 有则更换, 无则建立
+        conn.execute(
+            "INSERT INTO event_relations (event_id, parent_event_id, updated_at)"
+            " VALUES (?, ?, ?)"
+            " ON CONFLICT(event_id) DO UPDATE SET"
+            " parent_event_id = excluded.parent_event_id,"
+            " updated_at = excluded.updated_at",
+            (event_id, parent_event_id, updated_at),
+        )
+    return {
+        "event_id": event_id,
+        "parent_event_id": parent_event_id,
+        "changed": True,
+        "updated_at": updated_at,
+    }
+
+
+@app.get("/relations/{event_id}/ancestors")
+def get_ancestors(event_id: str = Path(..., min_length=1, max_length=255)):
+    """查询祖先链: 从最近父节点(depth=1)到根节点依次返回 event_id 与深度。
+
+    - 关系独立于 events 保存: 原事件被安全归档物理删除后, 已登记关系仍可按
+      event_id 查询; 遍历只走关系表, 因此链可以穿过已归档事件。
+    - 从未入库且没有任何已登记关系的 event_id 视为未知, 返回 404;
+      已知但没有父节点的事件返回空祖先列表。
+    """
+    with get_conn() as conn:
+        if not relation_known(conn, event_id):
+            return JSONResponse(status_code=404, content={"detail": "event not found"})
+        ancestors = walk_ancestors(conn, event_id)
+    return {
+        "event_id": event_id,
+        "ancestors": [
+            {"event_id": eid, "depth": depth} for eid, depth in ancestors
+        ],
+    }

@@ -85,6 +85,15 @@ CREATE TABLE IF NOT EXISTS count_view_buckets (
     count   INTEGER NOT NULL,                      -- 该日匹配的现存事件数(空桶即删, 恒 > 0)
     PRIMARY KEY (view_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS event_relations (
+    event_id        TEXT PRIMARY KEY,              -- 子事件(每个事件最多一个父事件, 即唯一父关系)
+    parent_event_id TEXT NOT NULL,                 -- 父事件; 故意不挂 events 外键, 原事件归档删除后关系仍保留可查
+    updated_at      TEXT NOT NULL                  -- 最近建立/更换父事件时间(UTC ISO8601); 重复设置同一父节点不更新
+);
+-- 按父事件反查: 祖先链遍历与"已登记关系"存在性判定
+CREATE INDEX IF NOT EXISTS idx_event_relations_parent
+    ON event_relations (parent_event_id);
 """
 
 
