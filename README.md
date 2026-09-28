@@ -8,7 +8,7 @@
 docker compose up --build
 ```
 
-一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表、日计数视图表)在启动时自动创建/升级,无需手工初始化。
+一条命令完成构建、数据库初始化与启动;服务监听 **8000** 端口,接口入口为 **http://localhost:8000**(交互式文档在 http://localhost:8000/docs,健康检查 http://localhost:8000/health)。SQLite 数据持久化在 named volume `webhook-data`,数据库表(含隔离记录表、快照导出表、日计数视图表、事件因果关系表)在启动时自动创建/升级,无需手工初始化。
 
 不用 compose 也可以:
 
@@ -464,6 +464,84 @@ curl -X DELETE http://localhost:8000/views/signup-ios
 
 未知名称的查询与删除统一返回 **404**;删除不影响事件本身与其他视图。
 
+### 13. 事件因果关系(唯一父事件)
+
+为已入库事件登记**唯一父事件**,形成一棵事件因果树(森林):`PUT /relations/{event_id}/parent` 设置或更换父节点,`GET /relations/{event_id}/ancestors` 查询祖先链。关系**独立于 events 表保存**(刻意不建外键)——原事件被安全归档压缩物理删除后,已登记的关系仍可按 `event_id` 查询;但**建立或修改关系时,父子两端事件必须当前仍存在**。
+
+先准备 3 个事件(复用上面 `/events` 接口):
+
+```bash
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"event_id":"evt-a","occurred_at":"2026-09-28T09:00:00Z","payload":{"k":"a"}}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"event_id":"evt-b","occurred_at":"2026-09-28T09:01:00Z","payload":{"k":"b"}}'
+curl -X POST http://localhost:8000/events -H 'Content-Type: application/json' \
+  -d '{"event_id":"evt-c","occurred_at":"2026-09-28T09:02:00Z","payload":{"k":"c"}}'
+```
+
+设置父事件(每个事件最多一个,重复 PUT 会**更换**):
+
+```bash
+# evt-c -> evt-b
+curl -X PUT http://localhost:8000/relations/evt-c/parent \
+  -H 'Content-Type: application/json' -d '{"parent_id":"evt-b"}'
+# => {"event_id":"evt-c","parent_id":"evt-b","status":"set"}
+
+# evt-b -> evt-a
+curl -X PUT http://localhost:8000/relations/evt-b/parent \
+  -H 'Content-Type: application/json' -d '{"parent_id":"evt-a"}'
+# => {"event_id":"evt-b","parent_id":"evt-a","status":"set"}
+```
+
+- **幂等**:对同一事件重复设置**同一个**父节点原样成功,返回 `"status":"unchanged"`,不更新时间戳、不改变任何关系。
+- **必须是不同的现存事件**:子事件或父事件未知、或已被安全归档删除,返回 **404**(`event not found` / `parent event not found`);`parent_id` 等于路径里的 `event_id`(自环)返回 **409** `event cannot be its own parent`。
+- **环检测在同一写事务内沿父链完成**:若更换父事件会使父链成环,返回 **409** `relation change would create a cycle` 且**原关系不变**。例如已有 `evt-c -> evt-b -> evt-a` 时,再把根 `evt-a` 的父设为 `evt-c`:
+
+```bash
+curl -X PUT http://localhost:8000/relations/evt-a/parent \
+  -H 'Content-Type: application/json' -d '{"parent_id":"evt-c"}'
+# 409 {"detail":"relation change would create a cycle",
+#      "event_id":"evt-a","parent_id":"evt-c"}
+# evt-a 仍是根, 既有关系链不变
+```
+
+查询祖先链——按**最近父节点到根节点**排序,最近父节点深度为 1:
+
+```bash
+curl http://localhost:8000/relations/evt-c/ancestors
+```
+
+```json
+{
+  "event_id": "evt-c",
+  "count": 2,
+  "ancestors": [
+    {"event_id": "evt-b", "depth": 1},
+    {"event_id": "evt-a", "depth": 2}
+  ]
+}
+```
+
+未登记父事件的事件(根节点或游离事件)返回空链 `{"count":0,"ancestors":[]}`;**未知事件**(从未入库也没有任何已登记关系)返回 **404**。
+
+**归档后仍可查询**:关系表不随 `/retention/compact` 删除事件而清理。例如把 `evt-a`、`evt-b` 归档(物理删除)后:
+
+```bash
+# 关系仍在, 沿链穿越已归档节点继续返回
+curl http://localhost:8000/relations/evt-c/ancestors
+# => {"event_id":"evt-c","count":2,"ancestors":[
+#      {"event_id":"evt-b","depth":1},{"event_id":"evt-a","depth":2}]}
+# 已归档事件自身的关系也能按 ID 查到
+curl http://localhost:8000/relations/evt-b/ancestors
+# => {"event_id":"evt-b","count":1,"ancestors":[{"event_id":"evt-a","depth":1}]}
+
+# 但不能对已归档事件建立或修改关系(两端都必须当前存在)
+curl -X PUT http://localhost:8000/relations/evt-c/parent \
+  -H 'Content-Type: application/json' -d '{"parent_id":"evt-a"}'
+# => 404 {"detail":"parent event not found","event_id":"evt-a"}
+# 子事件已归档时同样 404 event not found, 其原有关系保持不变
+```
+
 ## 哈希链规范
 
 每条记录写入时在同一事务内计算并存储两个字段:
@@ -495,6 +573,7 @@ curl -X DELETE http://localhost:8000/views/signup-ios
 - **安全归档压缩**:`POST /retention/compact` 在单个 `BEGIN IMMEDIATE` 事务内完成"读锚点 → 算安全边界(所有 consumer 的最小 `cursor_seq`,无 consumer 时为当前最大 seq)→ 校验 `cutoff_seq` → 删连续前缀 → 写链锚点"。越界 409 并返回 `safe_through_seq`;`dry_run` 只算不写;已覆盖区间幂等返回 `noop`。
 - **持久化快照导出**:`POST /exports` 在单个 `BEGIN IMMEDIATE` 事务内完成"读链锚点 → 写快照元数据(锚点 seq/hash、末尾 seq、总数)→ `INSERT ... SELECT` 整体复制当前全部未压缩事件到 `export_events`",与事件写入、压缩归档串行,副本与元数据来自同一时刻。副本落库后不可变:`GET /exports/{id}/events` 只查快照表,按 `(snapshot_id, seq)` 主键升序分页(多取一条判断 `next_after_seq`,末页为 `null`),后续写入/压缩/重启均不影响;`after_seq` 越出 `[anchor_seq, end_seq]` 返回 422。`DELETE /exports/{id}` 在同一事务内删除元数据与全部副本,未知或已删除统一 404。
 - **事件日计数视图**:规则存 `count_views`(名称 `UNIQUE`,重名 409),日桶计数存 `count_view_buckets`(`(view_id, day)` 主键)。`POST /views` 在单个 `BEGIN IMMEDIATE` 事务内"保存规则 → 全量扫描现存事件按 UTC 日期回填";`/events` 与 `/events/batch` 只对真正新建的条目逐视图匹配增量 +1(重复 `event_id` 走幂等分支,不动视图);`/retention/compact` 在同一事务内对被删前缀逐条扣减并移除空桶——因此视图始终等于"当前 events 表内匹配事件按发生日期的计数",迟到事件按 `occurred_at` 归其发生日期。`GET /views/{name}` 按名称返回各日计数与总数,`DELETE /views/{name}` 单事务删除规则与日桶,未知名称均 404。
+- **事件因果关系**:关系存独立表 `event_relations`(`event_id` 主键保证唯一父事件,另建 `parent_id` 索引),**不建指向 events 的外键**,故 `/retention/compact` 物理删除事件后已登记关系仍保留可查。`PUT /relations/{event_id}/parent` 在单个 `BEGIN IMMEDIATE` 事务内完成"校验子事件现存 → 校验父事件现存(均 404)→ 拒绝自环(409)→ 同一父节点幂等返回 `unchanged` → **从新父事件沿父链上行, 命中子事件即判定成环**(409, 原关系不变)→ UPSERT 写入/更换"。环检测从新父侧上行是关键:边的终点能沿现存边到达边的起点才成环(如 `c→b→a` 已存在,再把 `a` 指向 `c`),仅检查子事件祖先会漏判。`GET /relations/{event_id}/ancestors` 沿关系表上行(穿越已归档节点),按最近父节点到根返回 `event_id`/`depth`(最近父节点 depth=1);已知节点的判定覆盖 events 表与关系图两侧(登记过父或被他人登记为父),因此归档后仍按 ID 可查,只有完全未知的 ID 返回 404。
 - **配置**:数据库路径由环境变量 `DB_PATH` 控制(容器内默认 `/data/events.db`)。
 
 ## API 一览
@@ -519,6 +598,8 @@ curl -X DELETE http://localhost:8000/views/signup-ios
 | POST | `/views` | 创建事件日计数视图(唯一名称 + 可选 payload 顶层字符串字段等值条件):单事务回填现存事件,按 UTC 日期分桶;重名 409 |
 | GET | `/views/{name}` | 按名称查询视图:各 UTC 日计数(升序)及总数;未知名称 404 |
 | DELETE | `/views/{name}` | 单事务删除视图规则与全部日桶;未知名称 404 |
+| PUT | `/relations/{event_id}/parent` | 为现存事件设置/更换唯一父事件:同事务沿父链检测环(成环/自环 409 且原关系不变),同一父节点幂等;父子须为不同现存事件,缺失 404 |
+| GET | `/relations/{event_id}/ancestors` | 按最近父节点到根返回祖先 `event_id` 与 `depth`;关系独立存储,事件归档后仍可查;未知事件 404 |
 | GET | `/health` | 健康检查 |
 
 交互式文档:启动后访问 `http://localhost:8000/docs`。

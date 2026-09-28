@@ -90,6 +90,10 @@ class QuarantineIn(BaseModel):
         return v
 
 
+class ParentIn(BaseModel):
+    parent_id: str = Field(..., min_length=1, max_length=255)
+
+
 # ---------- helpers ----------
 
 def normalize_dt(dt: datetime) -> str:
@@ -1228,3 +1232,149 @@ def delete_view(name: str = Path(..., min_length=1, max_length=255)):
         conn.execute("DELETE FROM count_view_buckets WHERE view_id = ?", (view["id"],))
         conn.execute("DELETE FROM count_views WHERE id = ?", (view["id"],))
     return {"name": name, "deleted": True}
+
+
+# ---------- relations: 事件因果(唯一父事件) ----------
+
+def relation_parent_of(conn: sqlite3.Connection, event_id: str) -> Optional[str]:
+    """读取事件当前登记的父事件; 未登记返回 None。"""
+    row = conn.execute(
+        "SELECT parent_id FROM event_relations WHERE event_id = ?",
+        (event_id,),
+    ).fetchone()
+    return None if row is None else row["parent_id"]
+
+
+def ancestors_of(
+    conn: sqlite3.Connection,
+    event_id: str,
+    *,
+    start_depth: int = 1,
+) -> list[dict[str, Any]]:
+    """沿父链上行收集祖先, 按最近父节点到根节点排序, 深度从 start_depth 起。
+
+    关系独立于 events 保存: 遍历只看 event_relations, 即使中间节点已被安全归档
+    (物理删除), 仍可继续上行。visited 防止脏数据自环导致的无限循环。
+    """
+    out: list[dict[str, Any]] = []
+    visited = {event_id}
+    current = event_id
+    depth = start_depth
+    while True:
+        row = conn.execute(
+            "SELECT parent_id FROM event_relations WHERE event_id = ?",
+            (current,),
+        ).fetchone()
+        if row is None:
+            break
+        parent_id = row["parent_id"]
+        if parent_id in visited:
+            break
+        out.append({"event_id": parent_id, "depth": depth})
+        visited.add(parent_id)
+        current = parent_id
+        depth += 1
+    return out
+
+
+@app.put("/relations/{event_id}/parent")
+def set_parent(
+    event_id: str = Path(..., min_length=1, max_length=255),
+    req: ParentIn = Body(...),
+):
+    """为已入库事件设置或更换唯一父事件。
+
+    - 子事件(路径 event_id)与父事件(parent_id)必须是**当前仍存在于 events 表**
+      的不同事件: 任一缺失(含已被安全归档删除)返回 404, 父子相同返回 409;
+    - 同一写事务(BEGIN IMMEDIATE)内沿现存父链检查: 若变更会形成环
+      (从新父事件沿父链上行能到达子事件, 含父子相同)返回 **409**, 原关系不变;
+    - 重复设置同一父节点**幂等**: 已登记的 parent_id 与请求一致时原样成功, 不更新;
+    - 关系独立保存于 event_relations, 事件之后被归档删除不影响已登记关系的查询,
+      但建立/修改关系始终要求两端事件当时仍存在。
+    """
+    parent_id = req.parent_id
+    with get_conn() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        child = conn.execute(
+            "SELECT 1 FROM events WHERE event_id = ?", (event_id,)
+        ).fetchone()
+        if child is None:
+            # 未知或已归档的子事件: 不允许新建/修改关系(已归档事件的关系仍可经 GET 查询)
+            return JSONResponse(
+                status_code=404, content={"detail": "event not found", "event_id": event_id}
+            )
+        parent = conn.execute(
+            "SELECT 1 FROM events WHERE event_id = ?", (parent_id,)
+        ).fetchone()
+        if parent is None:
+            return JSONResponse(
+                status_code=404,
+                content={"detail": "parent event not found", "event_id": parent_id},
+            )
+        if parent_id == event_id:
+            return lease_conflict("event cannot be its own parent")
+
+        current_parent = relation_parent_of(conn, event_id)
+        if current_parent == parent_id:
+            # 重复设置同一父节点: 幂等成功, 原关系不变
+            return {
+                "event_id": event_id,
+                "parent_id": parent_id,
+                "status": "unchanged",
+            }
+
+        # 同一写事务内沿父链检查: 从新父事件上行, 若能到达子事件则新边必然成环
+        # (覆盖两类: 子事件是新父事件的现存祖先, 如 b->a 已存在又把 a 指向 b;
+        # 以及父子相同, 已在上面提前拦截)。仅看子事件自身祖先是不够的。
+        for ancestor in ancestors_of(conn, parent_id):
+            if ancestor["event_id"] == event_id:
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "detail": "relation change would create a cycle",
+                        "event_id": event_id,
+                        "parent_id": parent_id,
+                    },
+                )
+
+        # 每个事件唯一父事件: 已存在则更换(parent_id 不同), 不存在则新建
+        now = utc_now()
+        conn.execute(
+            "INSERT INTO event_relations (event_id, parent_id, created_at, updated_at)"
+            " VALUES (?, ?, ?, ?)"
+            " ON CONFLICT(event_id) DO UPDATE SET parent_id = excluded.parent_id,"
+            " updated_at = excluded.updated_at",
+            (event_id, parent_id, now, now),
+        )
+    return {"event_id": event_id, "parent_id": parent_id, "status": "set"}
+
+
+@app.get("/relations/{event_id}/ancestors")
+def get_ancestors(event_id: str = Path(..., min_length=1, max_length=255)):
+    """按最近父节点到根节点返回祖先链(含 event_id 与深度, 最近父节点 depth=1)。
+
+    - 未知事件(既不在 events 表、也没有任何已登记关系)返回 **404**;
+    - 关系独立于 events: 事件被安全归档删除后, 只要曾登记过关系,
+      仍可按 event_id 查询其祖先链(遍历不受中间节点归档影响);
+    - 没有登记父事件的现存事件返回空链, 根节点(父链顶端)不在列表中。
+    """
+    with get_conn() as conn:
+        # 已知节点: 仍在 events 表, 或在关系图中出现过(登记过父事件, 或被他人登记为父)。
+        # 后者保证安全归档删除后, 已登记关系涉及的 event_id 仍可按 ID 查询而非误报 404。
+        exists = conn.execute(
+            "SELECT 1 FROM events WHERE event_id = ?"
+            " UNION ALL SELECT 1 FROM event_relations WHERE event_id = ?"
+            " UNION ALL SELECT 1 FROM event_relations WHERE parent_id = ? LIMIT 1",
+            (event_id, event_id, event_id),
+        ).fetchone()
+        if exists is None:
+            return JSONResponse(
+                status_code=404, content={"detail": "event not found", "event_id": event_id}
+            )
+        ancestors = ancestors_of(conn, event_id)
+
+    return {
+        "event_id": event_id,
+        "count": len(ancestors),
+        "ancestors": ancestors,
+    }
